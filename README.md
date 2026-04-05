@@ -1,6 +1,6 @@
 # PocketBook OPDS Client
 
-An OPDS catalog client built in C for PocketBook e-readers. This application allows users to connect to OPDS servers (such as COPS, Calibre-Web, and Project Gutenberg), browse catalogs, search for titles, and download books directly to the device.
+An OPDS catalog client built in C for PocketBook e-readers. This application allows users to connect to OPDS servers (such as COPS, Calibre-Web, and Project Gutenberg), browse catalogs, search for titles, and download books directly to the device.  
 
 ## Features
 
@@ -51,7 +51,9 @@ The app logs network requests and errors if a trigger file is present.
 2. Run the application and perform the actions you wish to log.
 3. Open the `opds_client.log` file on your computer. This file contains `libcurl` network traces, HTTP headers, and redirect information.
 
+I have tested on a Pocketbook ERA and Inkpad Color 3 I made the ui scalable but have not tested on any older or lower resolution devices.
 ---
+
 
 ## Compiling from Source
 
