@@ -33,8 +33,8 @@ char page_stack[MAX_PAGE_STACK][MAX_STR_LEN];
 int page_offset_stack[MAX_PAGE_STACK];
 int page_stack_ptr = 0;
 int current_global_offset = 0;
-int jump_target_page = -1;
 int return_to_last_page = 0; 
+int jump_target_page = -1;
 int current_page = 0;
 #define ENTRIES_PER_PAGE 10
 
@@ -58,6 +58,13 @@ void GoBackInHierarchy();
 void FetchThumbnailsForPage();
 void ManageImageCache(); 
 void JIT_DecodePageThumbnails(); 
+
+// --- NEW: Centralized Visual Feedback Helper ---
+void FlashArea(int x, int y, int w, int h) {
+    InvertArea(x, y, w, h);
+    PartialUpdate(x, y, w, h);
+    usleep(100000); 
+}
 
 void SetTextFont(int size, int color) {
     ifont *f = NULL;
@@ -441,18 +448,15 @@ void JumpToPageCallback(char *text) {
     int max_local_pages = (entry_count + ENTRIES_PER_PAGE - 1) / ENTRIES_PER_PAGE;
     int current_batch_end = current_global_offset + max_local_pages;
 
-    // CASE 1: Teleporting within the currently loaded RAM batch
     if (target_absolute >= current_batch_start && target_absolute <= current_batch_end) {
         current_page = target_absolute - current_global_offset - 1;
         JIT_DecodePageThumbnails();
         Repaint();
         FetchThumbnailsForPage();
     } 
-    // CASE 2: The Time Machine! Teleporting to a previous batch in history
     else if (target_absolute < current_batch_start) {
         int found_index = -1;
         
-        // Search backwards through our history stack
         for (int i = page_stack_ptr - 1; i >= 0; i--) {
             if (target_absolute > page_offset_stack[i]) {
                 found_index = i;
@@ -461,14 +465,11 @@ void JumpToPageCallback(char *text) {
         }
         
         if (found_index >= 0) {
-            // Calculate the exact local page inside that historical batch
             int new_local_page = target_absolute - page_offset_stack[found_index] - 1;
             
-            // Rewind the history stack pointers
             page_stack_ptr = found_index; 
             current_global_offset = page_offset_stack[found_index];
             
-            // Arm the Time Machine and fire the network request!
             jump_target_page = new_local_page;
             LoadCatalog(page_stack[found_index]);
         } else {
@@ -476,7 +477,6 @@ void JumpToPageCallback(char *text) {
             Repaint();
         }
     } 
-    // CASE 3: Trying to jump into the future
     else {
         Message(ICON_INFORMATION, "Unknown Territory", "Cannot jump to future pages without loading them first.", 3000);
         Repaint();
@@ -571,15 +571,13 @@ void LoadCatalog(const char *url) {
             SeparateTags(current_entries[i].summary); 
         }
 
-        current_state = STATE_BROWSING;                 
+        current_state = STATE_BROWSING;         
         
-        // Time Machine Intercept to allow jumping back to a page in a previous block 
         if (jump_target_page >= 0) {
             current_page = jump_target_page;
-            // Safety bounds check just in case the math was weird
             int max_p = (entry_count > 0) ? ((entry_count - 1) / ENTRIES_PER_PAGE) : 0;
             if (current_page > max_p) current_page = max_p;
-            jump_target_page = -1; // Reset it
+            jump_target_page = -1;
         } else if (return_to_last_page) {
             current_page = (entry_count > 0) ? ((entry_count - 1) / ENTRIES_PER_PAGE) : 0;
             return_to_last_page = 0;
@@ -588,7 +586,6 @@ void LoadCatalog(const char *url) {
         }
 
         JIT_DecodePageThumbnails();
-       
         Repaint(); 
         FetchThumbnailsForPage();
     } else { 
@@ -709,9 +706,10 @@ void DrawMainMenu() {
 }
 
 void HandleMainMenuTouch(int x, int y) {
-    int gap = sys_height / 60, hh = sys_height / 14, row_h = sys_height / 12, list_y = hh + gap;
+    int margin = sys_width / 20, gap = sys_height / 60, hh = sys_height / 14, row_h = sys_height / 12, list_y = hh + gap;
     for (int i = 0; i < server_count; i++) {
         if (y >= list_y && y <= list_y + row_h) {
+            FlashArea(margin * 2, list_y, sys_width - (margin * 4), row_h);
             current_server_index = i; 
             strncpy(current_host, servers[i].url, MAX_STR_LEN - 1);
             current_state = STATE_SERVER_OPTIONS; Repaint(); return; 
@@ -719,10 +717,12 @@ void HandleMainMenuTouch(int x, int y) {
         list_y += row_h;
     }
     if (y >= list_y + gap && y <= list_y + row_h + gap) {
+        FlashArea(margin * 2, list_y + gap, sys_width - (margin * 4), row_h);
         memset(&temp_server, 0, sizeof(OPDSServer)); temp_server.fetch_thumbs = 1; editing_server_index = -1;
         current_state = STATE_SERVER_FORM; Repaint(); return; 
     } 
     if (y >= list_y + row_h + (gap * 2)) {
+        FlashArea(margin * 2, list_y + row_h + (gap * 2), sys_width - (margin * 4), row_h);
         Message(ICON_INFORMATION, "Exiting", "Cleaning up...", 0); Repaint();
         ManageImageCache(); TriggerLibraryRefresh(); CloseApp(); 
     }
@@ -753,20 +753,27 @@ void HandleServerOptionsTouch(int x, int y) {
     int row_h = sys_height / 12;
     int top_y = sys_height / 5;
     int mid_y = sys_height / 2;
+    int bw = sys_width - (sys_width / 4);
+    int bx = sys_width / 8;
+    int m = sys_width / 20;
 
     if (y >= top_y && y <= top_y + row_h) {
+        FlashArea(bx, top_y, bw, row_h);
         nav_stack_ptr = 0; page_stack_ptr = 0; current_global_offset = 0; current_page = 0; 
         LoadCatalog(servers[current_server_index].url); return; 
     }
     if (y >= top_y + row_h + gap && y <= top_y + (row_h * 2) + gap) {
+        FlashArea(bx, top_y + row_h + gap, bw, row_h);
         editing_server_index = current_server_index; memcpy(&temp_server, &servers[current_server_index], sizeof(OPDSServer));
         current_state = STATE_SERVER_FORM; Repaint(); return;
     }
     if (y >= mid_y && y <= mid_y + row_h) {
+        FlashArea(bx, mid_y, bw, row_h);
         for (int i = current_server_index; i < server_count - 1; i++) servers[i] = servers[i + 1];
         server_count--; SaveServers(); current_state = STATE_MAIN_MENU; Repaint(); return;
     }
     if (y >= sys_height - 110 && y <= sys_height - 20) {
+        FlashArea(m, sys_height - 110, sys_width - (m * 2), 90);
         current_state = STATE_MAIN_MENU; Repaint(); return; 
     }
 }
@@ -801,19 +808,25 @@ void DrawServerForm() {
 
 void HandleServerFormTouch(int x, int y) {
     int gap = sys_height / 40, row_h = sys_height / 12, ly = (sys_height / 10);
+    int box_x = sys_width / 4, box_w = sys_width - box_x - (sys_width / 10);
     
-    if (y >= ly && y <= ly + row_h) { OpenKeyboard("Name", temp_server.name, MAX_STR_LEN - 1, 0, KbdCallback); return; } ly += row_h + gap;
-    if (y >= ly && y <= ly + row_h) { OpenKeyboard("URL", temp_server.url, MAX_STR_LEN - 1, 0, KbdCallback); return; } ly += row_h + gap;
-    if (y >= ly && y <= ly + row_h) { OpenKeyboard("User", temp_server.user, MAX_STR_LEN - 1, 0, KbdCallback); return; } ly += row_h + gap;
-    if (y >= ly && y <= ly + row_h) { OpenKeyboard("Pass", temp_server.pass, MAX_STR_LEN - 1, 0, KbdCallback); return; } ly += row_h + gap;
+    if (y >= ly && y <= ly + row_h) { FlashArea(box_x, ly, box_w, row_h); OpenKeyboard("Name", temp_server.name, MAX_STR_LEN - 1, 0, KbdCallback); return; } ly += row_h + gap;
+    if (y >= ly && y <= ly + row_h) { FlashArea(box_x, ly, box_w, row_h); OpenKeyboard("URL", temp_server.url, MAX_STR_LEN - 1, 0, KbdCallback); return; } ly += row_h + gap;
+    if (y >= ly && y <= ly + row_h) { FlashArea(box_x, ly, box_w, row_h); OpenKeyboard("User", temp_server.user, MAX_STR_LEN - 1, 0, KbdCallback); return; } ly += row_h + gap;
+    if (y >= ly && y <= ly + row_h) { FlashArea(box_x, ly, box_w, row_h); OpenKeyboard("Pass", temp_server.pass, MAX_STR_LEN - 1, 0, KbdCallback); return; } ly += row_h + gap;
     
-    if (y >= ly && y <= ly + row_h) { temp_server.fetch_thumbs = !temp_server.fetch_thumbs; Repaint(); return; } ly += row_h + (gap * 2);
+    if (y >= ly && y <= ly + row_h) { FlashArea(box_x, ly + (row_h / 2) - 20, 40, 40); temp_server.fetch_thumbs = !temp_server.fetch_thumbs; Repaint(); return; } ly += row_h + (gap * 2);
     
     if (y >= ly && y <= ly + row_h) {
-        if (x > sys_width / 2 && strlen(temp_server.name) > 0) {
-            if (editing_server_index >= 0) servers[editing_server_index] = temp_server;
-            else if (server_count < MAX_SERVERS) servers[server_count++] = temp_server;
-            SaveServers();
+        if (x < sys_width / 2) {
+            FlashArea(20, ly, (sys_width / 2) - 40, row_h);
+        } else {
+            FlashArea(sys_width / 2 + 20, ly, (sys_width / 2) - 40, row_h);
+            if (strlen(temp_server.name) > 0) {
+                if (editing_server_index >= 0) servers[editing_server_index] = temp_server;
+                else if (server_count < MAX_SERVERS) servers[server_count++] = temp_server;
+                SaveServers();
+            }
         }
         current_state = STATE_MAIN_MENU; Repaint();
     }
@@ -899,10 +912,8 @@ void DrawBrowsingView() {
         } else {
             int known_max = current_global_offset + local_max_pages;
             if (strlen(next_page_url) == 0) {
-                // No next page link? We know exactly how many pages there are!
                 snprintf(page_txt, sizeof(page_txt), "Page %d / %d", absolute_page, known_max);
             } else {
-                // More pages exist beyond this batch, use the '+' indicator
                 snprintf(page_txt, sizeof(page_txt), "Page %d / %d+", absolute_page, known_max);
             }
         }
@@ -966,40 +977,40 @@ void HandleBrowsingTouch(int x, int y) {
 
     if (y <= hh) {
         int btn_w = sys_width / 9; if (btn_w < 100) btn_w = 100;
+        int btn_h = hh / 2, btn_y = hh / 4;
         int back_x = sys_width - btn_w - 10, home_x = back_x - btn_w - 10, search_x = home_x - btn_w - 10, exit_x = 10;
-        
         int title_x = exit_x + btn_w + 20, title_w = search_x - title_x - 20;
 
         if (x >= search_x && x <= search_x + btn_w) {
+            FlashArea(search_x, btn_y, btn_w, btn_h);
             memset(search_input_buffer, 0, sizeof(search_input_buffer));
             OpenKeyboard("Search Catalog:", search_input_buffer, 255, 0, PerformSearch);
         } else if (x >= home_x && x <= home_x + btn_w) { 
+            FlashArea(home_x, btn_y, btn_w, btn_h);
             nav_stack_ptr = 0; page_stack_ptr = 0; current_global_offset = 0; current_page = 0; LoadCatalog(servers[current_server_index].url); 
-        } else if (x >= back_x && x <= back_x + btn_w) { GoBackInHierarchy(); } 
-        else if (x >= exit_x && x <= exit_x + btn_w) { 
+        } else if (x >= back_x && x <= back_x + btn_w) { 
+            FlashArea(back_x, btn_y, btn_w, btn_h);
+            GoBackInHierarchy(); 
+        } else if (x >= exit_x && x <= exit_x + btn_w) { 
+            FlashArea(exit_x, btn_y, btn_w, btn_h);
             Message(ICON_INFORMATION, "Exiting", "Cleaning up...", 0); Repaint(); ManageImageCache(); TriggerLibraryRefresh(); CloseApp(); 
-        } 
-        else if (x >= title_x && x <= title_x + title_w) {
-            nav_stack_ptr = 0; 
-            page_stack_ptr = 0; 
-            current_global_offset = 0;
-            current_state = STATE_SERVER_OPTIONS; 
-            Repaint();
+        } else if (x >= title_x && x <= title_x + title_w) {
+            FlashArea(title_x, hh / 6, title_w, 40); 
+            nav_stack_ptr = 0; page_stack_ptr = 0; current_global_offset = 0; current_state = STATE_SERVER_OPTIONS; Repaint();
         }
         return;
     }
     
     if (y >= footer_y) {
         if (x < sys_width / 2) { 
+            FlashArea(20, footer_y, sys_width/2 - 30, row_h);
             if (current_page > 0) { 
                 current_page--; JIT_DecodePageThumbnails(); Repaint(); FetchThumbnailsForPage(); 
             } else if (page_stack_ptr > 0) { 
-                page_stack_ptr--; 
-                return_to_last_page = 1; 
-                current_global_offset = page_offset_stack[page_stack_ptr];
-                LoadCatalog(page_stack[page_stack_ptr]); 
+                page_stack_ptr--; return_to_last_page = 1; current_global_offset = page_offset_stack[page_stack_ptr]; LoadCatalog(page_stack[page_stack_ptr]); 
             }
         } else if (x >= sys_width / 2) {
+            FlashArea(sys_width/2 + 10, footer_y, sys_width/2 - 30, row_h);
             if ((current_page + 1) * ENTRIES_PER_PAGE < entry_count) { 
                 current_page++; JIT_DecodePageThumbnails(); Repaint(); FetchThumbnailsForPage(); 
             } else if (strlen(next_page_url) > 0) {
@@ -1021,9 +1032,7 @@ void HandleBrowsingTouch(int x, int y) {
             OPDSEntry *e = &current_entries[i];
 
             // Visual e-ink feedback flash
-            InvertArea(0, ly, sys_width, row_h);
-            PartialUpdate(0, ly, sys_width, row_h);
-            usleep(100000); 
+            FlashArea(0, ly, sys_width, row_h);
 
             if (strlen(e->nav_url) > 0 && e->is_book == 0) {
                 if (nav_stack_ptr < MAX_NAV_STACK) strncpy(nav_stack[nav_stack_ptr++], last_loaded_url, MAX_STR_LEN - 1);
@@ -1079,6 +1088,7 @@ void HandleBookDetailsTouch(int x, int y) {
 
     for (int i = 0; i < e->format_count; i++) {
         if (y >= by && y <= by + 90) {
+            FlashArea(m, by, sys_width - (m * 2), 90);
             if (EnsureNetwork() != 0) { Repaint(); return; }
 
             char tmp_fname[MAX_STR_LEN], server_fname[256] = {0}; 
@@ -1096,5 +1106,8 @@ void HandleBookDetailsTouch(int x, int y) {
             Repaint(); return;
         } by += 110;
     }
-    if (y >= sys_height - 110) { UnloadGlobalCover(); current_state = STATE_BROWSING; Repaint(); }
+    if (y >= sys_height - 110) { 
+        FlashArea(m, sys_height - 110, sys_width - (m * 2), 90);
+        UnloadGlobalCover(); current_state = STATE_BROWSING; Repaint(); 
+    }
 }
