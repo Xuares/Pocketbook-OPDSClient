@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <ctype.h>
 #include <dirent.h>
+#include <dlfcn.h>
 #include "icons.h" 
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -36,7 +37,6 @@ int current_global_offset = 0;
 int return_to_last_page = 0; 
 int jump_target_page = -1;
 int current_page = 0;
-#define ENTRIES_PER_PAGE 10
 
 char last_loaded_url[MAX_STR_LEN] = {0};
 
@@ -59,6 +59,100 @@ void FetchThumbnailsForPage();
 void ManageImageCache(); 
 void JIT_DecodePageThumbnails(); 
 
+// --- NEW: Bulletproof Aggressive Dark Mode Detection ---
+int IsDarkMode() {
+    // 1. Try dynamic loading of ANY firmware 6.8+ inversion check function
+    static int checked_dl = 0;
+    static int (*dl_funcs[6])() = {NULL};
+    
+    if (!checked_dl) {
+        void *h = dlopen("libinkview.so", RTLD_LAZY);
+        if (!h) h = dlopen(NULL, RTLD_LAZY);
+        if (h) {
+            dl_funcs[0] = dlsym(h, "GetScreenInversionState");
+            dl_funcs[1] = dlsym(h, "IvGetScreenInversionState");
+            dl_funcs[2] = dlsym(h, "GetDarkMode");
+            dl_funcs[3] = dlsym(h, "IsDarkMode");
+            dl_funcs[4] = dlsym(h, "GetThemeDark");
+            dl_funcs[5] = dlsym(h, "IsThemeDark");
+        }
+        checked_dl = 1;
+    }
+    
+    for (int i = 0; i < 6; i++) {
+        if (dl_funcs[i] && dl_funcs[i]()) {
+            return 1;
+        }
+    }
+
+    // 2. Aggressive Config Hunt - bypass cache and look for any relevant key
+    const char* config_paths[] = {
+        "/mnt/ext1/system/config/global.cfg",
+        "/mnt/ext1/system/profiles/default/config/global.cfg",
+        NULL
+    };
+
+    for (int p = 0; config_paths[p] != NULL; p++) {
+        FILE *f = fopen(config_paths[p], "r");
+        if (f) {
+            char line[256];
+            while (fgets(line, sizeof(line), f)) {
+                // Look for keys set to 1 or true
+                if (strstr(line, "=1\n") || strstr(line, "=1\r") || strstr(line, "=true")) {
+                    char lower[256];
+                    for(int i = 0; line[i]; i++) lower[i] = tolower(line[i]);
+                    
+                    // Does it sound like dark mode? (Ignoring "night" to avoid smartlight false positives)
+                    if ((strstr(lower, "dark") || strstr(lower, "invert") || strstr(lower, "invers")) && 
+                        !strstr(lower, "night")) {
+                        
+                        char msg[512]; snprintf(msg, sizeof(msg), "HUNT: Detected dark mode via key -> %s", line);
+                        LogDebug(msg);
+                        fclose(f);
+                        return 1;
+                    }
+                }
+            }
+            fclose(f);
+        }
+    }
+    
+    return 0;
+}
+
+void DrawSmartBitmap(int x, int y, int w, int h, ibitmap *bmp, int flags, int preserve_color) {
+    if (!bmp) return;
+    
+    int is_dark = IsDarkMode();
+    int buffer_size = bmp->scanline * bmp->height;
+    unsigned char *ptr = bmp->data;
+    
+    // Pre-invert the raw image data in memory so the hardware inversion flips it back to normal
+    if (is_dark && preserve_color) {
+        for (int i = 0; i < buffer_size; i++) {
+            ptr[i] = ~ptr[i]; // Fast bitwise inversion
+        }
+    }
+    
+    DrawBitmapRect(x, y, w, h, bmp, flags);
+    
+    // Restore the image data immediately so the cached cover isn't permanently altered
+    if (is_dark && preserve_color) {
+        for (int i = 0; i < buffer_size; i++) {
+            ptr[i] = ~ptr[i]; // Flip it back
+        }
+    }
+}
+
+// Calculates the requested rows for the active server dynamically
+int GetCatalogRows() {
+    if (current_server_index >= 0 && current_server_index < server_count) {
+        int r = servers[current_server_index].catalog_rows;
+        return (r >= 4 && r <= 10) ? r : 10;
+    }
+    return 10;
+}
+
 // --- NEW: Centralized Visual Feedback Helper ---
 void FlashArea(int x, int y, int w, int h) {
     InvertArea(x, y, w, h);
@@ -67,11 +161,19 @@ void FlashArea(int x, int y, int w, int h) {
 }
 
 void SetTextFont(int size, int color) {
+    // Dynamic caching system so we can generate proportionally sized fonts on the fly!
+    static int cached_sizes[16] = {0};
+    static ifont* cached_fonts[16] = {NULL};
     ifont *f = NULL;
-    if (size == 48) { if (!font48) font48 = OpenFont("default", 48, 1); f = font48; }
-    else if (size == 36) { if (!font36) font36 = OpenFont("default", 36, 1); f = font36; }
-    else if (size == 30) { if (!font30) font30 = OpenFont("default", 30, 1); f = font30; }
-    else if (size == 24) { if (!font24) font24 = OpenFont("default", 24, 1); f = font24; }
+    for (int i = 0; i < 16; i++) {
+        if (cached_sizes[i] == size) { f = cached_fonts[i]; break; }
+        if (cached_sizes[i] == 0) {
+            cached_fonts[i] = OpenFont("default", size, 1);
+            cached_sizes[i] = size;
+            f = cached_fonts[i];
+            break;
+        }
+    }
     if (f) SetFont(f, color);
 }
 
@@ -444,8 +546,9 @@ void JumpToPageCallback(char *text) {
     int target_absolute = atoi(text);
     if (target_absolute <= 0) { Repaint(); return; }
 
+    int entries_per_page = GetCatalogRows();
     int current_batch_start = current_global_offset + 1;
-    int max_local_pages = (entry_count + ENTRIES_PER_PAGE - 1) / ENTRIES_PER_PAGE;
+    int max_local_pages = (entry_count + entries_per_page - 1) / entries_per_page;
     int current_batch_end = current_global_offset + max_local_pages;
 
     if (target_absolute >= current_batch_start && target_absolute <= current_batch_end) {
@@ -491,8 +594,9 @@ void TriggerLibraryRefresh() {
 
 void JIT_DecodePageThumbnails() {
     if (!servers[current_server_index].fetch_thumbs) return;
-    int start = current_page * ENTRIES_PER_PAGE;
-    int end = start + ENTRIES_PER_PAGE;
+    int entries_per_page = GetCatalogRows();
+    int start = current_page * entries_per_page;
+    int end = start + entries_per_page;
     if (end > entry_count) end = entry_count;
 
     for (int i = start; i < end; i++) {
@@ -507,12 +611,18 @@ void JIT_DecodePageThumbnails() {
 
 void FetchThumbnailsForPage() {
     if (!servers[current_server_index].fetch_thumbs) return;
-    int start = current_page * ENTRIES_PER_PAGE;
-    int end = start + ENTRIES_PER_PAGE;
+    int entries_per_page = GetCatalogRows();
+    int start = current_page * entries_per_page;
+    int end = start + entries_per_page;
     if (end > entry_count) end = entry_count;
 
-    int hh = sys_height / 14, row_h = sys_height / 13, gap = sys_height / 60;
-    int icon_h = row_h - 10, book_w = (int)(icon_h / 1.4);
+    int hh = sys_height / 14, gap = sys_height / 60;
+    int row_h = sys_height / 13;
+    int footer_y = sys_height - row_h - 10;
+    int list_start_y = hh + gap;
+    int list_avail_h = (footer_y - 55) - list_start_y;
+    int dynamic_row_h = list_avail_h / entries_per_page;
+    int icon_h = dynamic_row_h - 10, book_w = (int)(icon_h / 1.4);
 
     for (int i = start; i < end; i++) {
         if (list_thumbs[i]) continue;
@@ -525,9 +635,9 @@ void FetchThumbnailsForPage() {
                 list_thumbs[i] = LoadCoverSTB(t_path);
                 if (list_thumbs[i]) {
                     int row_index = i - start;
-                    int y_pos = hh + gap + (row_index * row_h);
+                    int y_pos = list_start_y + (row_index * dynamic_row_h);
                     int icon_y = y_pos + 5, b_x = 20 + ((icon_h - book_w) / 2);
-                    DrawBitmapRect(b_x, icon_y, book_w, icon_h, list_thumbs[i], STRETCH);
+                    DrawSmartBitmap(b_x, icon_y, book_w, icon_h, list_thumbs[i], STRETCH, 1);
                     PartialUpdate(b_x, icon_y, book_w, icon_h);
                 }
             }
@@ -546,9 +656,13 @@ void LoadCatalog(const char *url) {
 
     EnsureDirectories(); LoadStockIcons(); FreeListThumbs(); 
 
+    int is_dark = IsDarkMode();
+    int top_bg = is_dark ? 0xDDDDDD : 0x000000;
+    int top_fg = is_dark ? 0x000000 : 0xFFFFFF;
+
     int hh = sys_height / 14; 
-    FillArea(0, 0, sys_width, hh, 0x000000);
-    SetTextFont(36, 0xFFFFFF);
+    FillArea(0, 0, sys_width, hh, top_bg);
+    SetTextFont(36, top_fg);
     DrawTextRect(0, (hh/2)-20, sys_width, 40, "Connecting...", ALIGN_CENTER);
     FullUpdate(); 
     
@@ -575,11 +689,13 @@ void LoadCatalog(const char *url) {
         
         if (jump_target_page >= 0) {
             current_page = jump_target_page;
-            int max_p = (entry_count > 0) ? ((entry_count - 1) / ENTRIES_PER_PAGE) : 0;
+            int entries_per_page = GetCatalogRows();
+            int max_p = (entry_count > 0) ? ((entry_count - 1) / entries_per_page) : 0;
             if (current_page > max_p) current_page = max_p;
             jump_target_page = -1;
         } else if (return_to_last_page) {
-            current_page = (entry_count > 0) ? ((entry_count - 1) / ENTRIES_PER_PAGE) : 0;
+            int entries_per_page = GetCatalogRows();
+            current_page = (entry_count > 0) ? ((entry_count - 1) / entries_per_page) : 0;
             return_to_last_page = 0;
         } else { 
             current_page = 0; 
@@ -718,11 +834,15 @@ void HandleMainMenuTouch(int x, int y) {
     }
     if (y >= list_y + gap && y <= list_y + row_h + gap) {
         FlashArea(margin * 2, list_y + gap, sys_width - (margin * 4), row_h);
-        memset(&temp_server, 0, sizeof(OPDSServer)); temp_server.fetch_thumbs = 1; editing_server_index = -1;
+        memset(&temp_server, 0, sizeof(OPDSServer)); 
+        temp_server.fetch_thumbs = 1; 
+        temp_server.catalog_rows = 10;
+        editing_server_index = -1;
         current_state = STATE_SERVER_FORM; Repaint(); return; 
     } 
     if (y >= list_y + row_h + (gap * 2)) {
         FlashArea(margin * 2, list_y + row_h + (gap * 2), sys_width - (margin * 4), row_h);
+
         Message(ICON_INFORMATION, "Exiting", "Cleaning up...", 0); Repaint();
         ManageImageCache(); TriggerLibraryRefresh(); CloseApp(); 
     }
@@ -784,10 +904,10 @@ void DrawServerForm() {
     DrawTextRect(0, gap, sys_width, 60, (editing_server_index >= 0) ? "Edit Server" : "Add Server", ALIGN_CENTER);
     SetTextFont(36, 0x000000); 
     
-    const char *labels[] = {"Name:", "URL:", "User:", "Pass:", "Thumbs:"};
+    const char *labels[] = {"Name:", "URL:", "User:", "Pass:", "Thumbs:", "Rows:"};
     char *vals[] = {temp_server.name, temp_server.url, temp_server.user, temp_server.pass};
     
-    for(int i=0; i<5; i++) {
+    for(int i=0; i<6; i++) {
         DrawTextRect(20, y + (gap / 2), box_x - 30, 40, labels[i], ALIGN_LEFT); 
         if (i < 4) {
             DrawRect(box_x, y, box_w, row_h, 0x000000);
@@ -795,9 +915,19 @@ void DrawServerForm() {
                 char m[256] = {0}; for(size_t j=0; j<strlen(vals[i]); j++) m[j] = '*';
                 DrawTextRect(box_x + 15, y + (gap / 2), box_w - 30, 40, m, ALIGN_LEFT);
             } else { DrawTextRect(box_x + 15, y + (gap / 2), box_w - 30, 40, vals[i], ALIGN_LEFT); }
-        } else {
+        } else if (i == 4) {
             DrawRect(box_x, y + (row_h / 2) - 20, 40, 40, 0x000000);
             if (temp_server.fetch_thumbs) FillArea(box_x + 5, y + (row_h / 2) - 15, 30, 30, 0x555555); 
+        } else if (i == 5) {
+            DrawRect(box_x, y, 60, row_h, 0x000000);
+            SetTextFont(36, 0x000000);
+            DrawTextRect(box_x, y + (row_h / 2) - 20, 60, 40, "-", ALIGN_CENTER);
+            
+            char r_buf[16]; snprintf(r_buf, sizeof(r_buf), "%d", temp_server.catalog_rows);
+            DrawTextRect(box_x + 70, y + (row_h / 2) - 20, box_w - 140, 40, r_buf, ALIGN_CENTER);
+            
+            DrawRect(box_x + box_w - 60, y, 60, row_h, 0x000000);
+            DrawTextRect(box_x + box_w - 60, y + (row_h / 2) - 20, 60, 40, "+", ALIGN_CENTER);
         }
         y += row_h + gap;
     }
@@ -815,8 +945,21 @@ void HandleServerFormTouch(int x, int y) {
     if (y >= ly && y <= ly + row_h) { FlashArea(box_x, ly, box_w, row_h); OpenKeyboard("User", temp_server.user, MAX_STR_LEN - 1, 0, KbdCallback); return; } ly += row_h + gap;
     if (y >= ly && y <= ly + row_h) { FlashArea(box_x, ly, box_w, row_h); OpenKeyboard("Pass", temp_server.pass, MAX_STR_LEN - 1, 0, KbdCallback); return; } ly += row_h + gap;
     
-    if (y >= ly && y <= ly + row_h) { FlashArea(box_x, ly + (row_h / 2) - 20, 40, 40); temp_server.fetch_thumbs = !temp_server.fetch_thumbs; Repaint(); return; } ly += row_h + (gap * 2);
+    if (y >= ly && y <= ly + row_h) { FlashArea(box_x, ly + (row_h / 2) - 20, 40, 40); temp_server.fetch_thumbs = !temp_server.fetch_thumbs; Repaint(); return; } ly += row_h + gap;
     
+    if (y >= ly && y <= ly + row_h) { 
+        if (x >= box_x && x <= box_x + 60) {
+            FlashArea(box_x, ly, 60, row_h);
+            if (temp_server.catalog_rows > 4) temp_server.catalog_rows--; // Lower limit is now 4
+            Repaint(); return;
+        } else if (x >= box_x + box_w - 60 && x <= box_x + box_w) {
+            FlashArea(box_x + box_w - 60, ly, 60, row_h);
+            if (temp_server.catalog_rows < 10) temp_server.catalog_rows++;
+            Repaint(); return;
+        }
+    }
+    ly += row_h + (gap * 2);
+
     if (y >= ly && y <= ly + row_h) {
         if (x < sys_width / 2) {
             FlashArea(20, ly, (sys_width / 2) - 40, row_h);
@@ -833,10 +976,16 @@ void HandleServerFormTouch(int x, int y) {
 }
 
 void DrawBrowsingView() {
+    int is_dark = IsDarkMode();
+    int top_bg = is_dark ? 0xDDDDDD : 0x000000;
+    int top_fg = is_dark ? 0x000000 : 0xFFFFFF;
+    int top_sub_fg = is_dark ? 0x555555 : 0xCCCCCC;
+
+    int entries_per_page = GetCatalogRows();
     int hh = sys_height / 14, row_h = sys_height / 13, gap = sys_height / 60;
     int footer_y = sys_height - row_h - 10; 
 
-    FillArea(0, 0, sys_width, hh, 0x000000);
+    FillArea(0, 0, sys_width, hh, top_bg);
     
     int btn_w = sys_width / 9;
     if (btn_w < 100) btn_w = 100; 
@@ -848,11 +997,11 @@ void DrawBrowsingView() {
     int exit_x = 10;
     int title_x = exit_x + btn_w + 20, title_w = search_x - title_x - 20;
 
-    SetTextFont(24, 0xCCCCCC);
+    SetTextFont(24, top_sub_fg);
     const char *display_title = (strlen(current_feed_title) > 0) ? current_feed_title : last_loaded_url;
     DrawTextRect(title_x, (hh / 2) + 5, title_w, 30, display_title, ALIGN_LEFT | DOTS);
 
-    SetTextFont(36, 0xFFFFFF); 
+    SetTextFont(36, top_fg); 
     DrawTextRect(title_x, hh / 6, title_w, 40, "Catalog", ALIGN_LEFT | DOTS);
 
     DrawButton(search_x, btn_y, btn_w, btn_h, "SEARCH", 0);
@@ -860,54 +1009,89 @@ void DrawBrowsingView() {
     DrawButton(back_x, btn_y, btn_w, btn_h, "BACK", 0); 
     DrawButton(exit_x, btn_y, btn_w, btn_h, "EXIT", 2);
 
-    int y = hh + gap; 
+    int list_start_y = hh + gap;
+    int list_avail_h = (footer_y - 55) - list_start_y;
+    int dynamic_row_h = list_avail_h / entries_per_page;
+    int y = list_start_y; 
     
     if (entry_count == 0) { 
         SetTextFont(36, 0x000000);
         DrawTextRect(0, sys_height / 3, sys_width, 60, "No items found.", ALIGN_CENTER); 
     } else {
-        int start = current_page * ENTRIES_PER_PAGE, end = start + ENTRIES_PER_PAGE;
+        int start = current_page * entries_per_page, end = start + entries_per_page;
         if (end > entry_count) end = entry_count;
         
-        int icon_h = row_h - 10, book_w = (int)(icon_h / 1.4); 
+        // Calculate font sizes using a dampened scale so they don't blow up at low rows
+        float scale = (float)dynamic_row_h / (float)row_h;
+        float font_scale = 1.0f + ((scale - 1.0f) * 0.4f);
+        
+        int title_font_size = (int)(36 * font_scale);
+        if (title_font_size > 44) title_font_size = 44; // Cap the maximum font size
+        
+        int author_font_size = (int)(24 * font_scale);
+        if (author_font_size > 32) author_font_size = 32; // Cap the maximum font size
+
+        int icon_h = dynamic_row_h - 10, book_w = (int)(icon_h / 1.4); 
         int text_x = 20 + icon_h + 15, text_w = sys_width - text_x - 20;
 
         for (int i = start; i < end; i++) {
-            if (y + row_h > footer_y - 40) break;
+            if (y + dynamic_row_h > footer_y - 55) break;
             int icon_y = y + 5;
 
             if (current_entries[i].is_book) {
                 int b_x = 20 + ((icon_h - book_w) / 2);
-                if (servers[current_server_index].fetch_thumbs && list_thumbs[i]) DrawBitmapRect(b_x, icon_y, book_w, icon_h, list_thumbs[i], STRETCH);
-                else if (book_fallback_bmp) DrawBitmapRect(b_x, icon_y, book_w, icon_h, book_fallback_bmp, STRETCH);
+                if (servers[current_server_index].fetch_thumbs && list_thumbs[i]) DrawSmartBitmap(b_x, icon_y, book_w, icon_h, list_thumbs[i], STRETCH, 1);
+                else if (book_fallback_bmp) DrawSmartBitmap(b_x, icon_y, book_w, icon_h, book_fallback_bmp, STRETCH, 0);
                 else { FillArea(b_x, icon_y, book_w, icon_h, 0xDDDDDD); DrawRect(b_x, icon_y, book_w, icon_h, 0x000000); }
             } else {
                 if (folder_icon_bmp) {
                     int folder_w = (icon_h * folder_icon_bmp->width) / folder_icon_bmp->height;
                     int f_x = 20 + ((icon_h - folder_w) / 2); 
-                    DrawBitmapRect(f_x, icon_y, folder_w, icon_h, folder_icon_bmp, STRETCH);
+                    DrawSmartBitmap(f_x, icon_y, folder_w, icon_h, folder_icon_bmp, STRETCH, 0);
                 } else { 
                     FillArea(20, icon_y, icon_h, icon_h, 0x999999); DrawRect(20, icon_y, icon_h, icon_h, 0x000000); 
                 }
             }
 
             if (current_entries[i].is_book) {
-                SetTextFont(36, 0x000000); DrawTextRect(text_x, y + 20, text_w, 40, current_entries[i].title, ALIGN_LEFT | DOTS);
-                if (strlen(current_entries[i].author) > 0) { SetTextFont(24, 0x555555); DrawTextRect(text_x, y + 70, text_w, 40, current_entries[i].author, ALIGN_LEFT | DOTS); }
+                SetTextFont(title_font_size, 0x000000); 
+                
+                // Allow the title to dynamically wrap up to a maximum height
+                int max_title_h = dynamic_row_h - author_font_size - 25; // Reserve room at the bottom for the author
+                int actual_title_h = TextRectHeight(text_w, current_entries[i].title, ALIGN_LEFT);
+                if (actual_title_h > max_title_h) actual_title_h = max_title_h;
+                
+                // Draw wrapped title, adding DOTS only if it hits the maximum allowed height
+                DrawTextRect(text_x, y + 10, text_w, actual_title_h, current_entries[i].title, ALIGN_LEFT | DOTS);
+                
+                if (strlen(current_entries[i].author) > 0) { 
+                    SetTextFont(author_font_size, 0x555555); 
+                    // Pin author right below the title text
+                    DrawTextRect(text_x, y + 10 + actual_title_h + 5, text_w, author_font_size + 10, current_entries[i].author, ALIGN_LEFT | DOTS); 
+                }
             } else {
-                SetTextFont(36, 0x000000); DrawTextRect(text_x, y + (row_h / 2) - 18, text_w, 40, current_entries[i].title, ALIGN_LEFT | DOTS);
+                SetTextFont(title_font_size, 0x000000); 
+                
+                // For folders, use the entire height to allow deep wrapping
+                int max_title_h = dynamic_row_h - 20;
+                int actual_title_h = TextRectHeight(text_w, current_entries[i].title, ALIGN_LEFT);
+                if (actual_title_h > max_title_h) actual_title_h = max_title_h;
+                
+                // Vertically center the folder text
+                int text_y = y + (dynamic_row_h - actual_title_h) / 2;
+                DrawTextRect(text_x, text_y, text_w, actual_title_h, current_entries[i].title, ALIGN_LEFT | DOTS);
             }
 
-            DrawLine(20, y + row_h, sys_width - 20, y + row_h, 0xAAAAAA);
-            y += row_h;
+            DrawLine(20, y + dynamic_row_h, sys_width - 20, y + dynamic_row_h, 0xAAAAAA);
+            y += dynamic_row_h;
         }
 
         char page_txt[128]; 
         int absolute_page = current_global_offset + current_page + 1;
-        int local_max_pages = (entry_count + ENTRIES_PER_PAGE - 1) / ENTRIES_PER_PAGE;
+        int local_max_pages = (entry_count + entries_per_page - 1) / entries_per_page;
         
         if (total_results > 0) {
-            int absolute_max_pages = (total_results + ENTRIES_PER_PAGE - 1) / ENTRIES_PER_PAGE;
+            int absolute_max_pages = (total_results + entries_per_page - 1) / entries_per_page;
             snprintf(page_txt, sizeof(page_txt), "Page %d / %d   |   Total Catalog: %d", absolute_page, absolute_max_pages, total_results);
         } else {
             int known_max = current_global_offset + local_max_pages;
@@ -919,7 +1103,7 @@ void DrawBrowsingView() {
         }
         
         SetTextFont(24, 0x555555); 
-        DrawTextRect(0, footer_y - 60, sys_width, 30, page_txt, ALIGN_CENTER);
+        DrawTextRect(0, footer_y - 45, sys_width, 30, page_txt, ALIGN_CENTER);
         
         if (current_page > 0 || page_stack_ptr > 0) DrawButton(20, footer_y, sys_width/2 - 30, row_h, "<< PREV", 0);
         if (end < entry_count) DrawButton(sys_width/2 + 10, footer_y, sys_width/2 - 30, row_h, "NEXT >>", 0);
@@ -944,8 +1128,10 @@ void HandleHardwareButtons(int key) {
 
     if (current_state != STATE_BROWSING) return;
     
+    int entries_per_page = GetCatalogRows();
+    
     if (key == IV_KEY_NEXT || key == 0x207) {
-        if ((current_page + 1) * ENTRIES_PER_PAGE < entry_count) {
+        if ((current_page + 1) * entries_per_page < entry_count) {
             current_page++; JIT_DecodePageThumbnails(); Repaint(); FetchThumbnailsForPage();   
         } else if (strlen(next_page_url) > 0) {
             if (page_stack_ptr < MAX_PAGE_STACK) {
@@ -953,7 +1139,7 @@ void HandleHardwareButtons(int key) {
                 page_offset_stack[page_stack_ptr] = current_global_offset;
                 page_stack_ptr++;
             }
-            current_global_offset += (entry_count + ENTRIES_PER_PAGE - 1) / ENTRIES_PER_PAGE;
+            current_global_offset += (entry_count + entries_per_page - 1) / entries_per_page;
             LoadCatalog(next_page_url);
         }
     } else if (key == IV_KEY_PREV || key == 0x206) {
@@ -973,6 +1159,7 @@ void HandleHardwareButtons(int key) {
 }
 
 void HandleBrowsingTouch(int x, int y) {
+    int entries_per_page = GetCatalogRows();
     int hh = sys_height / 14, row_h = sys_height / 13, gap = sys_height / 60, footer_y = sys_height - row_h - 10;
 
     if (y <= hh) {
@@ -1011,7 +1198,7 @@ void HandleBrowsingTouch(int x, int y) {
             }
         } else if (x >= sys_width / 2) {
             FlashArea(sys_width/2 + 10, footer_y, sys_width/2 - 30, row_h);
-            if ((current_page + 1) * ENTRIES_PER_PAGE < entry_count) { 
+            if ((current_page + 1) * entries_per_page < entry_count) { 
                 current_page++; JIT_DecodePageThumbnails(); Repaint(); FetchThumbnailsForPage(); 
             } else if (strlen(next_page_url) > 0) {
                 if (page_stack_ptr < MAX_PAGE_STACK) {
@@ -1019,20 +1206,23 @@ void HandleBrowsingTouch(int x, int y) {
                     page_offset_stack[page_stack_ptr] = current_global_offset;
                     page_stack_ptr++;
                 }
-                current_global_offset += (entry_count + ENTRIES_PER_PAGE - 1) / ENTRIES_PER_PAGE;
+                current_global_offset += (entry_count + entries_per_page - 1) / entries_per_page;
                 LoadCatalog(next_page_url);
             }
         } 
         return;
     }
     
-    int start = current_page * ENTRIES_PER_PAGE, ly = hh + gap;
-    for (int i = start; i < start + ENTRIES_PER_PAGE && i < entry_count; i++) {
-        if (y >= ly && y <= ly + row_h) {
+    int list_start_y = hh + gap;
+    int list_avail_h = (footer_y - 55) - list_start_y;
+    int dynamic_row_h = list_avail_h / entries_per_page;
+    int start = current_page * entries_per_page, ly = list_start_y;
+    for (int i = start; i < start + entries_per_page && i < entry_count; i++) {
+        if (y >= ly && y <= ly + dynamic_row_h) {
             OPDSEntry *e = &current_entries[i];
 
             // Visual e-ink feedback flash
-            FlashArea(0, ly, sys_width, row_h);
+            FlashArea(0, ly, sys_width, dynamic_row_h);
 
             if (strlen(e->nav_url) > 0 && e->is_book == 0) {
                 if (nav_stack_ptr < MAX_NAV_STACK) strncpy(nav_stack[nav_stack_ptr++], last_loaded_url, MAX_STR_LEN - 1);
@@ -1052,7 +1242,7 @@ void HandleBrowsingTouch(int x, int y) {
             } 
             return;
         } 
-        ly += row_h; if (ly + row_h > footer_y - 40) break;
+        ly += dynamic_row_h; if (ly + dynamic_row_h > footer_y - 55) break;
     }
 }
 
@@ -1064,7 +1254,7 @@ void DrawBookDetails() {
     SetTextFont(36, 0x555555); DrawTextRect(m, m + 110, sys_width - (m * 2), 50, e->author, ALIGN_LEFT);
     
     int thumb_y = m + 180; FillArea(m, thumb_y, thumb_w, thumb_h, 0xFFFFFF); 
-    if (current_cover_bmp) { DrawBitmapRect(m, thumb_y, thumb_w, thumb_h, current_cover_bmp, STRETCH); } 
+    if (current_cover_bmp) { DrawSmartBitmap(m, thumb_y, thumb_w, thumb_h, current_cover_bmp, STRETCH, 1); } 
     else { FillArea(m, thumb_y, thumb_w, thumb_h, 0xDDDDDD); SetTextFont(24, 0x000000); DrawTextRect(m, thumb_y + (thumb_h / 2) - 20, thumb_w, 40, "[NO COVER]", ALIGN_CENTER); }
     
     SetTextFont(30, 0x000000); 

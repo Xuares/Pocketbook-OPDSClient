@@ -14,11 +14,15 @@
 #define MAX_STR_LEN 512
 #define MAX_ENTRIES 1500
 #define MAX_FORMATS 5
-#define CFG_FILE "/mnt/ext1/system/config/opds_client.cfg"
-#define BOOKS_DIR "/mnt/ext1/Downloads/"
 
 #define APP_ROOT_DIR "/mnt/ext1/applications/OPDSClient/"
 #define IMAGES_DIR APP_ROOT_DIR "images/"
+#define BOOKS_DIR "/mnt/ext1/Downloads/"
+
+// New and Legacy Config File Locations
+#define NEW_CFG_FILE APP_ROOT_DIR "opds_client.cfg"
+#define LEGACY_CFG_FILE "/mnt/ext1/system/config/opds_client.cfg"
+
 #define FOLDER_ICON IMAGES_DIR "folder.png"
 #define BOOK_ICON IMAGES_DIR "book.png"
 
@@ -38,6 +42,7 @@ typedef struct {
     char user[MAX_STR_LEN];
     char pass[MAX_STR_LEN];
     int fetch_thumbs; 
+    int catalog_rows;
 } OPDSServer;
 
 typedef struct {

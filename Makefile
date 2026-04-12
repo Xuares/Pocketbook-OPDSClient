@@ -11,7 +11,7 @@ OBJ = $(SRC:.c=.o)
 # LDFLAGS: Changed -lft2 to -lfreetype
 # Added explicit path to the sysroot library folder where libfreetype.so lives
 LDFLAGS = -L$(SYSROOT)/usr/lib \
-          -linkview -lcurl -lxml2 -lfreetype -lm
+          -linkview -lcurl -lxml2 -lfreetype -lm -ldl
 
 CFLAGS = -Wall -O2 \
          -I$(SYSROOT)/usr/include \
