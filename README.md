@@ -23,7 +23,8 @@ An OPDS catalog client built in C for PocketBook e-readers. This application all
 1. Download the compiled `OPDSClient.app` file.
 2. Connect your PocketBook to your computer via USB.
 3. Copy `OPDSClient.app` into the `applications` folder on your device's internal storage. *(Note: This folder may be hidden by your computer's operating system).*
-4. Disconnect the device. The app will be available in your PocketBook's "Applications" menu.
+4. OPTIONAL:  If you want to have a couple of starting servers aleady configured you can copy the `opds_client.cfg` file into the `applications\OPDSClient\` folder.  If you havn't run the application yet the `OPDSClient` folder won't exist. You will have to create it manually or run the app once and come back and copy this file.
+5. Disconnect the device. The app will be available in your PocketBook's "Applications" menu.
 
 ---
 
