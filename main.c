@@ -4,10 +4,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <dlfcn.h> // Included for dynamic library loading (dlsym)
 
-#ifndef CFG_FILE
-#define CFG_FILE "/mnt/ext1/system/config/opds_client.cfg"
+// --- Dark Mode / Capabilities Definitions ---
+// We define these here just in case the older SDK headers don't have them
+#ifndef APP_CAPABILITY_SUPPORT_SCREEN_INVERSION
+#define APP_CAPABILITY_SUPPORT_SCREEN_INVERSION (1 << 0)
 #endif
+
+typedef void (*IvSetAppCapability_t)(int);
 
 // Global State Variables
 enum AppState current_state = STATE_MAIN_MENU; 
@@ -18,6 +25,17 @@ int selected_entry_index = -1;
 OPDSServer servers[MAX_SERVERS];
 OPDSServer temp_server;
 OPDSEntry current_entries[MAX_ENTRIES];
+
+// Temporary struct required to safely migrate users with legacy binary files 
+// without crashing due to mismatched struct sizes
+typedef struct {
+    char name[MAX_STR_LEN];
+    char url[MAX_STR_LEN];
+    char user[MAX_STR_LEN];
+    char pass[MAX_STR_LEN];
+    int fetch_thumbs; 
+} OldOPDSServer;
+
 int entry_count = 0;
 char current_host[MAX_STR_LEN];
 int sys_width, sys_height;
@@ -74,22 +92,150 @@ void Repaint() {
 }
 
 void SaveServers() {
-    FILE *fp = fopen(CFG_FILE, "wb");
-    if (fp) {
-        fwrite(&server_count, sizeof(int), 1, fp);
-        fwrite(servers, sizeof(OPDSServer), server_count, fp);
-        fclose(fp);
+    // Ensure the application directory exists before attempting to save!
+    mkdir(APP_ROOT_DIR, 0777);
+
+    // Touch the file to ensure it exists before OpenConfig tries to read it
+    FILE *f = fopen(NEW_CFG_FILE, "a");
+    if (f) fclose(f);
+
+    // Use InkView's built-in config system
+    iconfig *cfg = OpenConfig(NEW_CFG_FILE, NULL);
+    if (!cfg) {
+        LogDebug("Failed to open config for saving.");
+        return;
     }
+
+    WriteInt(cfg, "server_count", server_count);
+    
+    for (int i = 0; i < server_count; i++) {
+        char key[64];
+        
+        snprintf(key, sizeof(key), "server_%d_name", i); 
+        WriteString(cfg, key, servers[i].name);
+        
+        snprintf(key, sizeof(key), "server_%d_url", i);  
+        WriteString(cfg, key, servers[i].url);
+        
+        snprintf(key, sizeof(key), "server_%d_user", i); 
+        WriteString(cfg, key, servers[i].user);
+        
+        snprintf(key, sizeof(key), "server_%d_pass", i); 
+        WriteString(cfg, key, servers[i].pass);
+        
+        snprintf(key, sizeof(key), "server_%d_fetch_thumbs", i); 
+        WriteInt(cfg, key, servers[i].fetch_thumbs);
+        
+        snprintf(key, sizeof(key), "server_%d_catalog_rows", i); 
+        WriteInt(cfg, key, servers[i].catalog_rows);
+    }
+    
+    SaveConfig(cfg);
+    CloseConfig(cfg);
 }
 
 void LoadServers() {
-    FILE *fp = fopen(CFG_FILE, "rb");
-    if (fp) {
-        if (fread(&server_count, sizeof(int), 1, fp) == 1) {
+    // Ensure the app directory is available immediately on boot
+    mkdir(APP_ROOT_DIR, 0777);
+
+    // --- NORMAL TEXT LOAD FROM NEW LOCATION ---
+    // Explicitly check if the file exists on the filesystem first.
+    if (access(NEW_CFG_FILE, F_OK) == 0) {
+        iconfig *cfg = OpenConfig(NEW_CFG_FILE, NULL);
+        if (cfg) {
+            server_count = ReadInt(cfg, "server_count", 0);
             if (server_count > MAX_SERVERS) server_count = MAX_SERVERS;
-            fread(servers, sizeof(OPDSServer), server_count, fp);
+
+            for (int i = 0; i < server_count; i++) {
+                char key[64];
+                
+                snprintf(key, sizeof(key), "server_%d_name", i);
+                strncpy(servers[i].name, ReadString(cfg, key, ""), MAX_STR_LEN - 1);
+                
+                snprintf(key, sizeof(key), "server_%d_url", i);
+                strncpy(servers[i].url, ReadString(cfg, key, ""), MAX_STR_LEN - 1);
+                
+                snprintf(key, sizeof(key), "server_%d_user", i);
+                strncpy(servers[i].user, ReadString(cfg, key, ""), MAX_STR_LEN - 1);
+                
+                snprintf(key, sizeof(key), "server_%d_pass", i);
+                strncpy(servers[i].pass, ReadString(cfg, key, ""), MAX_STR_LEN - 1);
+                
+                snprintf(key, sizeof(key), "server_%d_fetch_thumbs", i);
+                servers[i].fetch_thumbs = ReadInt(cfg, key, 1); 
+                
+                snprintf(key, sizeof(key), "server_%d_catalog_rows", i);
+                servers[i].catalog_rows = ReadInt(cfg, key, 10); 
+                if (servers[i].catalog_rows < 4) servers[i].catalog_rows = 4;
+                if (servers[i].catalog_rows > 10) servers[i].catalog_rows = 10;
+            }
+
+            CloseConfig(cfg);
         }
-        fclose(fp);
+        return; // Successfully loaded from new location
+    }
+
+    // --- MIGRATION CHECK FROM LEGACY LOCATION ---
+    if (access(LEGACY_CFG_FILE, F_OK) == 0) {
+        FILE *fp = fopen(LEGACY_CFG_FILE, "rb");
+        if (fp) {
+            int magic_check = -1;
+            fread(&magic_check, sizeof(int), 1, fp);
+            fclose(fp);
+
+            if (magic_check >= 0 && magic_check <= MAX_SERVERS) {
+                LogDebug("Detected old binary config format in legacy location. Migrating...");
+                fp = fopen(LEGACY_CFG_FILE, "rb");
+                if (fread(&server_count, sizeof(int), 1, fp) == 1) {
+                    if (server_count > MAX_SERVERS) server_count = MAX_SERVERS;
+                    OldOPDSServer old_servers[MAX_SERVERS];
+                    fread(old_servers, sizeof(OldOPDSServer), server_count, fp);
+                    for(int i = 0; i < server_count; i++) {
+                        strncpy(servers[i].name, old_servers[i].name, MAX_STR_LEN);
+                        strncpy(servers[i].url, old_servers[i].url, MAX_STR_LEN);
+                        strncpy(servers[i].user, old_servers[i].user, MAX_STR_LEN);
+                        strncpy(servers[i].pass, old_servers[i].pass, MAX_STR_LEN);
+                        servers[i].fetch_thumbs = old_servers[i].fetch_thumbs;
+                        servers[i].catalog_rows = 10; // Default new property
+                    }
+                }
+                fclose(fp);
+            } else {
+                LogDebug("Detected intermediate text config in legacy location. Migrating...");
+                iconfig *old_cfg = OpenConfig(LEGACY_CFG_FILE, NULL);
+                if (old_cfg) {
+                    server_count = ReadInt(old_cfg, "server_count", 0);
+                    if (server_count > MAX_SERVERS) server_count = MAX_SERVERS;
+
+                    for (int i = 0; i < server_count; i++) {
+                        char key[64];
+                        snprintf(key, sizeof(key), "server_%d_name", i);
+                        strncpy(servers[i].name, ReadString(old_cfg, key, ""), MAX_STR_LEN - 1);
+                        snprintf(key, sizeof(key), "server_%d_url", i);
+                        strncpy(servers[i].url, ReadString(old_cfg, key, ""), MAX_STR_LEN - 1);
+                        snprintf(key, sizeof(key), "server_%d_user", i);
+                        strncpy(servers[i].user, ReadString(old_cfg, key, ""), MAX_STR_LEN - 1);
+                        snprintf(key, sizeof(key), "server_%d_pass", i);
+                        strncpy(servers[i].pass, ReadString(old_cfg, key, ""), MAX_STR_LEN - 1);
+                        snprintf(key, sizeof(key), "server_%d_fetch_thumbs", i);
+                        servers[i].fetch_thumbs = ReadInt(old_cfg, key, 1); 
+                        snprintf(key, sizeof(key), "server_%d_catalog_rows", i);
+                        servers[i].catalog_rows = ReadInt(old_cfg, key, 10); 
+                        if (servers[i].catalog_rows < 4) servers[i].catalog_rows = 4;
+                        if (servers[i].catalog_rows > 10) servers[i].catalog_rows = 10;
+                    }
+                    CloseConfig(old_cfg);
+                }
+            }
+            
+            // Backup the old file so we don't read it again
+            char bak_file[MAX_STR_LEN];
+            snprintf(bak_file, sizeof(bak_file), "%s.bak", LEGACY_CFG_FILE);
+            rename(LEGACY_CFG_FILE, bak_file); 
+            
+            // Save immediately in the new robust text format at the NEW location
+            SaveServers(); 
+        }
     } else {
         server_count = 0;
     }
@@ -103,6 +249,23 @@ static int main_handler(int event, int a, int b) {
             sys_height = ScreenHeight();
             LoadServers();
             LogDebug("--- App Started ---");
+
+            // --- Dynamic Loading for Dark Mode (FW 6.8+) ---
+            // Try to open the inkview library to see if it supports native screen inversion
+            void *lib_handle = dlopen("libinkview.so", RTLD_LAZY);
+            if (!lib_handle) lib_handle = dlopen(NULL, RTLD_LAZY); // Fallback to global symbol space
+            
+            if (lib_handle) {
+                IvSetAppCapability_t set_cap = (IvSetAppCapability_t)dlsym(lib_handle, "IvSetAppCapability");
+                if (set_cap) {
+                    LogDebug("Firmware 6.8+ detected. Enabling native dark mode.");
+                    set_cap(APP_CAPABILITY_SUPPORT_SCREEN_INVERSION);
+                } else {
+                    LogDebug("Firmware < 6.8. Native dark mode unsupported.");
+                }
+                // Not calling dlclose(lib_handle) intentionally, as inkview is a core system 
+                // dependency permanently linked to our app's lifetime anyway.
+            }
             break;
 
         case EVT_SHOW:
@@ -114,6 +277,12 @@ static int main_handler(int event, int a, int b) {
             
         case EVT_BACKGROUND:
             // Handle device sleep or app minimization
+            break;
+
+        case EVT_CONFIGCHANGED:
+        case EVT_OBREEY_CONFIG_CHANGED:
+            // Triggers a redraw if the user toggles Dark Mode from the system drop-down menu
+            Repaint();
             break;
 
         case EVT_KEYPRESS:
