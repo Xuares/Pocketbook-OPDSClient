@@ -23,14 +23,15 @@ jobs:
             5keeve/pocketbook-sdk:6.3.0-b288-v1 \
             -c "make"
 
+      - name: Prepare binary extension
+        run: |
+          if [ -f "OPDSClient" ]; then
+            mv OPDSClient OPDSClient.app
+          fi
+
       - name: Upload compiled binary
         uses: actions/upload-artifact@v4
         with:
           name: OPDSClient
-          path: |
-            *
-            !*.c
-            !*.h
-            !Makefile
-            !.*
+          path: OPDSClient.app
           retention-days: 90
