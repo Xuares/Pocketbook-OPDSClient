@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest 
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
@@ -16,11 +16,11 @@ jobs:
 
       - name: Compile application inside SDK container
         run: |
-          docker run --rm -v ${{ github.workspace }}:/work -w /work 5keeve/pbsdk:6.3.0 make
+          docker run --rm -v ${{ github.workspace }}:/work -w /work 5keeve/pocketbook-sdk:6.3.0-b288-v1 make
 
       - name: Upload compiled binary
         uses: actions/upload-artifact@v4
         with:
           name: pocketbook-application
-          path: "**/*.app" 
-          retention-days: 90 
+          path: "**/*.app"
+          retention-days: 90
