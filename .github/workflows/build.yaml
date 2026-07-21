@@ -33,6 +33,7 @@ jobs:
           if [ -f "OPDSClient" ]; then
             mv OPDSClient OPDSClient.app
           fi
+          zip -r OPDSClient.zip OPDSClient.app
 
       - name: Upload compiled binary to Artifacts
         uses: actions/upload-artifact@v4
@@ -45,6 +46,8 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: OPDSClient.app
+          files: OPDSClient.zip
+          generate_release_notes: true 
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
