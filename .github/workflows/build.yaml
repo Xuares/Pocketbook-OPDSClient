@@ -1,0 +1,26 @@
+name: Build PocketBook App
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest 
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compile application inside SDK container
+        run: |
+          docker run --rm -v ${{ github.workspace }}:/work -w /work 5keeve/pbsdk:6.3.0 make
+
+      - name: Upload compiled binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: pocketbook-application
+          path: "**/*.app" 
+          retention-days: 90 
